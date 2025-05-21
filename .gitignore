@@ -1,0 +1,15 @@
+# Ignore log files
+*.log
+
+# Ignore Excel files
+*.xls
+*.xlsx
+
+# Ignore sub-module
+panPHP/
+dist/
+!dist/PanoramaAuditor.exe
+
+# Ignore random crap
+.venv/
+.idea/

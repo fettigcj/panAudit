@@ -1,0 +1,159 @@
+{
+  "AuditSections": {
+    "All Rules": {
+      "sectionDescription": "Rules to measure other audits against",
+      "sectionAudits": {
+        "AllRules": {
+          "title": "All Rules",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "",
+          "description": "All rules - The denominator into which other audits will divide to determine the percentage of rules they match.",
+          "ruletype": "security"
+        }
+      }
+    },
+    "Logging": {
+      "sectionDescription": "Audits related to logging and log forwarding",
+      "sectionAudits": {
+        "NoLog": {
+          "title": "Unlogged",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "!(log at.start) and !(log at.end)",
+          "description": "Rules that neither log at start nor end. Few rules should be processed silently.",
+          "ruletype": "security"
+        },
+        "LogStart": {
+          "title": "LogStart",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(log at.start)",
+          "description": "Rules that log at session start for troubleshooting purposes. Log-at-end is preferred for normal logging as all data will be available at session end.",
+          "ruletype": "security"
+        },
+        "LogEnd": {
+          "title": "LogEnd",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(log at.end)",
+          "description": "Rules that log at session end. Almost all rules should log at end.",
+          "ruletype": "security"
+        },
+        "Unforwarded": {
+          "title": "Unforwarded",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "((log at.start) or (log at.end)) and !(logprof is.set)",
+          "description": "Rules which lack a log forwarding profile. If a log is not forwarded to external (SIEM) storage there will be no record of it once it expires from local storage.",
+          "ruletype": "security"
+        }
+      }
+    },
+    "Application Of Security Profiles": {
+      "sectionDescription": "Audits related to security profile application",
+      "sectionAudits": {
+        "NoSecProf": {
+          "title": "NoSecProf",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(secprof not.set) and (action is.allow)",
+          "description": "Allow rules that don't have security profiles applied, functioning as a layer 4 ACL without NGFW inspection",
+          "ruletype": "security"
+        },
+        "SecProfNotGroup": {
+          "title": "SecProfNotGroup",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(secprof type.is.profile)",
+          "description": "Rules that use individual security profiles instead of profile groups",
+          "ruletype": "security"
+        },
+        "SecProfDeny": {
+          "title": "SecProfDeny",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.deny) and (secprof is.set)",
+          "description": "Rules that deny traffic but have security profiles. Attempting to apply inspection to blocked traffic is an oxymoron.",
+          "ruletype": "security"
+        }
+      }
+    },
+    "Use of 'Any'": {
+      "sectionDescription": "Audits related to the use of 'any' in rules",
+      "sectionAudits": {
+        "AllowAnyAppAnyPort": {
+          "title": "AllowAnyAppAnyPort",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (app is.any) and (service is.any)",
+          "description": "Rules that allow any application on any port; Very few source/dest pairs should have unlimited access.",
+          "ruletype": "security"
+        },
+        "AllowAnyApp": {
+          "title": "AllowAnyApp",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (app is.any) and !(service is.any)",
+          "description": "Rules that allow any application; Few source/dest pairs should have unrestricted app access",
+          "ruletype": "security"
+        },
+        "AllowAnyPort": {
+          "title": "AllowAnyPort",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and !(app is.any) and (service is.any)",
+          "description": "Rules that allow an app on any port. Proper App-ID adoption requires specific, preferably 'app default', ports",
+          "ruletype": "security"
+        },
+        "DenyAppNonAnyPort": {
+          "title": "DenyAppNonAnyPort",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.deny) and !(app is.any) and !(service is.any)",
+          "description": "Rules that deny an app on specific ports. Most app denials should be regardless of port",
+          "ruletype": "security"
+        },
+        "AnySourceAnyDest": {
+          "title": "AnySourceAnyDest",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (dst is.any) and (src is.any)",
+          "description": "A \"Least Privilege Check\": Rules with any source and any destination IP. Few rules should allow access regardless of IP.",
+          "ruletype": "security"
+        },
+        "AnyAnySource": {
+          "title": "AnyAnySource",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (from is.any) and (src is.any)",
+          "description": "A \"Least Privilege Check\": Rules with any source and any source zone; Very few rules should ignore the source address.",
+          "ruletype": "security"
+        },
+        "AnyIPSource": {
+          "title": "AnyIPSource",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (src is.any)",
+          "description": "A \"Least Privilege Check\": Rules with any source. It is preferable to filter source IP's to required hosts",
+          "ruletype": "security"
+        },
+        "AnyAnyDest": {
+          "title": "AnyAnyDest",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (to is.any) and (dst is.any)",
+          "description": "Rules with any destination and any destination zone",
+          "ruletype": "security"
+        },
+        "AnyIPDest": {
+          "title": "AnyIPDest",
+          "workbookName": "S{sectNum}A{auditNum}_{auditName}.xls",
+          "baseFilter": "(action is.allow) and (dst is.any)",
+          "description": "Rules with any destination",
+          "ruletype": "security"
+        }
+      }
+    }
+  },
+  "SPG_Audits": {
+    "SPG-AllRules": {
+      "title": "SPG-AllRules",
+      "workbookName": "spg{spgNum}A{auditNum}_{spgName}_{auditName}.xls",
+      "baseFilter": "",
+      "description": "Rules that use the {spgName} security profile group",
+      "ruletype": "security"
+    },
+    "SPG-Allows": {
+      "title": "SPG-Allows",
+      "workbookName": "spg{spgNum}A{auditNum}_{spgName}_{auditName}.xls",
+      "baseFilter": "(action is.allow)",
+      "description": "Allow rules that use the {spgName} security profile group",
+      "ruletype": "security"
+    }
+  }
+}
