@@ -56,9 +56,15 @@ def create_executable():
             "--onefile",  # Create a single executable file
             "--windowed",  # Don't show the console window when running the app
             "--add-data", f"config{os.pathsep}config",  # Include the configuration directory
+            "--add-data", f"src{os.pathsep}src",  # Include the source code directory
             "--icon=NONE",  # No icon for now, can be customized later
             "pan_audit_gui.py"  # The main script to package
         ]
+
+        # Convert paths to use backslashes on Windows
+        if os.name == 'nt':
+            pyinstaller_cmd[9] = f"config{os.pathsep}config".replace('/', '\\')
+            pyinstaller_cmd[11] = f"src{os.pathsep}src".replace('/', '\\')
 
         # Run PyInstaller
         subprocess.run(pyinstaller_cmd, check=True)
@@ -80,13 +86,25 @@ def copy_additional_files():
         print("Copying additional files...")
 
         # Create the dist/panPHP directory if it doesn't exist
-        dist_panphp_dir = Path("../dist/panPHP")
+        dist_panphp_dir = Path("dist/panPHP")
         if not dist_panphp_dir.exists():
             dist_panphp_dir.mkdir(parents=True)
             print(f"Created directory: {dist_panphp_dir}")
 
+        # Create the dist/log directory if it doesn't exist
+        dist_log_dir = Path("dist/log")
+        if not dist_log_dir.exists():
+            dist_log_dir.mkdir(parents=True)
+            print(f"Created directory: {dist_log_dir}")
+
+        # Create the dist/output directory if it doesn't exist
+        dist_output_dir = Path("dist/output")
+        if not dist_output_dir.exists():
+            dist_output_dir.mkdir(parents=True)
+            print(f"Created directory: {dist_output_dir}")
+
         # Copy the panPHP directory if it exists
-        panphp_dir = Path("../panPHP")
+        panphp_dir = Path("panPHP")
         if panphp_dir.exists() and panphp_dir.is_dir():
             # Use shutil.copytree with dirs_exist_ok=True for Python 3.8+
             # For earlier versions, we would need to remove the directory first
