@@ -5,8 +5,9 @@ This module provides a task queue for executing commands in parallel.
 
 Workflow:
 1. add_task() - Called by the GUI to submit a task
-2. _execute_task() - Runs the task in a worker thread
-3. _update_status() - Handles the task result and updates the UI
+2. _worker_thread() - Worker thread that processes tasks from the queue
+3. _execute_task() - Executes the task and waits for it to complete
+4. _update_status() - Handles the task result and updates the UI
 """
 
 import os
@@ -20,7 +21,7 @@ import threading
 import shutil
 import warnings
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
 from src.core.command_handler import CommandArgumentHandler
 
 # Configure logging
@@ -53,29 +54,20 @@ class TaskQueue:
                 - log_file (str, optional): Path to the log file
                 - err_file (str, optional): Path to the error file
             max_workers (int, optional): Maximum number of worker threads to use for parallel execution.
-                Defaults to 5.
+                This parameter is kept for backward compatibility but is no longer used.
+                The number of worker threads is now equal to max_active_processes.
             max_active_processes (int, optional): Maximum number of concurrent processes to run.
                 Defaults to 10.
         """
-        self.queue = []
+        self.task_queue = Queue()  # Thread-safe queue for tasks
+        self.task_list = []  # List to keep track of all tasks (for status reporting)
         self.result_callback = result_callback
-        self.running = False
-        self.current_task = None
+        self.running = True  # Start in running state
         self.app_dir = os.getcwd()
         self.utils_dir = os.path.join(self.app_dir, "panPHP", "utils")
         self.log_dir = os.path.join(self.app_dir, "log")
         self.output_dir = os.path.join(self.app_dir, "output")
         self.use_separate_window = False  # Always use direct subprocess execution
-
-        # Initialize thread pool for parallel task execution
-        self.executor = ThreadPoolExecutor(max_workers=max_workers)
-        self.futures = {}  # Track futures by audit_id
-
-        # Add semaphore to limit concurrent processes
-        self.max_active_processes = max_active_processes
-        self.active_processes = 0
-        self.process_semaphore = threading.Semaphore(max_active_processes)
-        logger.info(f"Initialized TaskQueue with max_workers={max_workers}, max_active_processes={max_active_processes}")
 
         # Detect operating system
         self.is_windows = sys.platform.startswith('win')
@@ -85,6 +77,80 @@ class TaskQueue:
             os.makedirs(self.log_dir)
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+
+        # Add semaphore to limit concurrent processes
+        self.max_active_processes = max_active_processes
+        self.process_semaphore = threading.Semaphore(max_active_processes)
+        logger.info(f"Initialized TaskQueue with max_active_processes={max_active_processes}")
+        
+        # Create worker threads
+        self.workers = []
+        for i in range(max_active_processes):
+            thread = threading.Thread(target=self._worker_thread, daemon=True, name=f"Worker-{i+1}")
+            thread.start()
+            self.workers.append(thread)
+            logger.debug(f"Started worker thread {i+1}/{max_active_processes}")
+            
+    def _worker_thread(self):
+        """Worker thread function that processes tasks from the queue"""
+        while self.running:
+            try:
+                # Get a task from the queue (blocking with timeout)
+                try:
+                    task = self.task_queue.get(timeout=1)
+                except Empty:
+                    # Queue is empty, continue waiting
+                    continue
+                    
+                # Extract task details
+                audit_id = task['audit_id']
+                cmd_args = task['cmd_args']
+                metadata = task['metadata']
+                
+                logger.debug(f"Worker thread processing task: audit_id={audit_id}")
+                
+                # Update task status to Queued
+                self._update_status(audit_id, "Queued", "Task picked up by worker thread, waiting for semaphore...")
+                
+                # Try to acquire the semaphore
+                logger.debug(f"Trying to acquire process semaphore for audit_id={audit_id}")
+                if self.process_semaphore.acquire(blocking=True):
+                    try:
+                        # Update status to Running
+                        self._update_status(audit_id, "Running", "Executing command...")
+                        
+                        # Execute the task
+                        self._execute_task(audit_id, cmd_args, metadata)
+                        
+                        # Mark task as done in the queue
+                        self.task_queue.task_done()
+                    except Exception as e:
+                        logger.error(f"Error executing task: {str(e)}")
+                        logger.error(traceback.format_exc())
+                        
+                        # Update task status
+                        self._update_status(
+                            audit_id, 
+                            "Error", 
+                            f"Error executing task: {str(e)}"
+                        )
+                    finally:
+                        # Release the semaphore
+                        logger.debug(f"Releasing process semaphore for audit_id={audit_id}")
+                        self.process_semaphore.release()
+                else:
+                    # This should not happen with blocking=True, but just in case
+                    logger.warning(f"Failed to acquire semaphore for audit_id={audit_id}")
+                    
+                    # Put the task back in the queue
+                    self.task_queue.put(task)
+                    self.task_queue.task_done()
+                    
+                    # Sleep a bit to prevent CPU spinning
+                    time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error in worker thread: {str(e)}")
+                logger.error(traceback.format_exc())
 
     def add_task(self, audit_id, cmd_args, metadata=None, paused=False):
         """Add a task to the queue for parallel execution
@@ -114,46 +180,27 @@ class TaskQueue:
                 'paused': paused  # Add paused state to the task
             }
 
-            # Add the task to the queue for tracking
-            self.queue.append(task)
+            # Add the task to the list for tracking
+            self.task_list.append(task)
 
-            # Check if we should pause this task
-            should_pause = paused
-
-            # Count active tasks (those that are not paused and not completed)
-            active_tasks = 0
-            for t in self.queue:
-                if not t.get('paused', False) and t.get('status', '') not in ['Completed', 'Failed', 'Error']:
-                    active_tasks += 1
-
-            # If we already have max_workers active tasks, pause this one
-            if active_tasks >= self.executor._max_workers:
-                should_pause = True
-                logger.info(f"Thread pool is full ({active_tasks}/{self.executor._max_workers}), pausing task: audit_id={audit_id}")
-
-            # Only submit to thread pool if not paused
-            if not should_pause:
-                # Update task status to Queued before submitting to thread pool
-                self._update_status(audit_id, "Queued", "Task added, waiting for available thread...")
-                self._submit_to_thread_pool(task)
+            # Only add to the queue if not paused
+            if not paused:
+                # Update task status to Queued
+                self._update_status(audit_id, "Queued", "Task added to queue, waiting for worker thread...")
+                
+                # Add the task to the queue for processing
+                self.task_queue.put(task)
+                logger.debug(f"Added task to queue: audit_id={audit_id}")
             else:
-                # Mark the task as paused
-                task['paused'] = True
                 # Update task status to Paused
-                if paused:
-                    # User explicitly paused this task
-                    self._update_status(audit_id, "Paused", "Task paused by user")
-                else:
-                    # Task paused due to thread pool being full
-                    self._update_status(audit_id, "Paused", f"Waiting for available thread (max {self.executor._max_workers} threads)...")
-                audit_name = metadata.get('audit_name') if metadata else None
-                logger.info(f"Task added in paused state: audit_id={audit_id}, audit_name={audit_name}")
+                self._update_status(audit_id, "Paused", "Task paused by user")
+                logger.debug(f"Added task in paused state: audit_id={audit_id}")
 
             audit_name = metadata.get('audit_name') if metadata else None
-            logger.info(f"Added task to queue: audit_id={audit_id}, audit_name={audit_name}, paused={task.get('paused', False)}")
+            logger.info(f"Added task: audit_id={audit_id}, audit_name={audit_name}, paused={paused}")
             return True
         except Exception as e:
-            logger.error(f"Failed to add task to queue: {str(e)}")
+            logger.error(f"Failed to add task: {str(e)}")
             logger.error(traceback.format_exc())
             return False
 
@@ -168,273 +215,153 @@ class TaskQueue:
             "Task processing now starts automatically when tasks are added.",
             DeprecationWarning, stacklevel=2
         )
-        logger.info("Task processing is handled by the thread pool")
+        logger.info("Task processing is handled by worker threads")
         return
 
-    def _submit_to_thread_pool(self, task):
-        """Submit a task to the thread pool for execution
-
-        Args:
-            task (dict): The task to submit
-        """
-        audit_id = task['audit_id']
-        cmd_args = task['cmd_args']
-        metadata = task['metadata']
-
-        # Submit the task to the thread pool for execution, using the semaphore wrapper
-        future = self.executor.submit(
-            self._execute_task_with_semaphore,
-            audit_id,
-            cmd_args,
-            metadata
-        )
-
-        # Store the future for tracking
-        self.futures[audit_id] = future
-
-        audit_name = metadata.get('audit_name') if metadata else None
-        logger.info(f"Submitted task to thread pool: audit_id={audit_id}, audit_name={audit_name}")
-
-        # Note: We don't update the status here because the task is still in "Queued" state
-        # The status will be updated to "Running" when the task actually starts executing in _execute_task
-
-    def _execute_task_with_semaphore(self, audit_id, cmd_args, metadata=None):
-        """Execute a task with semaphore control to limit concurrent processes
-
-        This method tries to acquire the semaphore before executing the task.
-        If the semaphore can't be acquired immediately, the task is paused.
-        The semaphore will be released by the monitoring thread when the process completes.
-
-        Args:
-            audit_id (str): The unique identifier for the audit task
-            cmd_args (dict): The command arguments as a dictionary
-            metadata (dict, optional): A dictionary containing metadata about the audit
-        """
-        # Try to acquire semaphore with a timeout to prevent indefinite blocking
-        logger.debug(f"Trying to acquire process semaphore for audit_id={audit_id}")
-
-        # First try non-blocking acquisition
-        if self.process_semaphore.acquire(blocking=False):
-            logger.debug(f"Acquired process semaphore immediately for audit_id={audit_id}")
-            acquired = True
-        else:
-            # If immediate acquisition fails, update status to Paused
-            logger.info(f"No semaphore immediately available, marking task as paused: audit_id={audit_id}")
-            self._update_status(audit_id, "Paused", "Waiting for available process slot...")
-
-            # Try to acquire with a timeout
-            try:
-                # Try to acquire with a 5-second timeout
-                acquired = self.process_semaphore.acquire(blocking=True, timeout=5)
-                if acquired:
-                    logger.debug(f"Acquired process semaphore after waiting for audit_id={audit_id}")
-                    # Update status back to Queued
-                    self._update_status(audit_id, "Queued", "Process slot available, preparing to execute...")
-                else:
-                    logger.info(f"Semaphore acquisition timed out for audit_id={audit_id}, scheduling retry")
-                    # Schedule a retry after a delay
-                    self._retry_paused_task(audit_id, cmd_args, metadata)
-                    return
-            except Exception as e:
-                logger.error(f"Error acquiring semaphore: {str(e)}")
-                logger.error(traceback.format_exc())
-                # Schedule a retry after a delay
-                self._retry_paused_task(audit_id, cmd_args, metadata)
-                return
-
-        # If we got here, we acquired the semaphore
-        if acquired:
-            try:
-                # Execute the task, passing the semaphore
-                # The semaphore will be released by the monitoring thread when the process completes
-                self._execute_task(audit_id, cmd_args, metadata, semaphore=self.process_semaphore)
-            except Exception as e:
-                # If an error occurs before the task is executed, release the semaphore
-                logger.error(f"Error executing task with semaphore: {str(e)}")
-                logger.error(traceback.format_exc())
-
-                # Release the semaphore
-                logger.debug(f"Releasing process semaphore for audit_id={audit_id} due to exception")
-                self.process_semaphore.release()
-
-                # Update task status
-                self._update_status(
-                    audit_id, 
-                    "Error", 
-                    f"Error executing task: {str(e)}"
-                )
-        else:
-            # This should not happen, but just in case
-            logger.warning(f"Failed to acquire semaphore for audit_id={audit_id} but didn't schedule retry")
-            # Schedule a retry after a delay
-            self._retry_paused_task(audit_id, cmd_args, metadata)
-
-    def _retry_paused_task(self, audit_id, cmd_args, metadata=None):
-        """Retry a paused task after a delay
-
-        Args:
-            audit_id (str): The unique identifier for the audit task
-            cmd_args (dict): The command arguments as a dictionary
-            metadata (dict, optional): A dictionary containing metadata about the audit
-        """
-        import threading
-        import time
-        import random
-
-        # Use a single retry thread instead of creating a new one for each retry
-        def retry_task():
-            try:
-                # Add a random component to the delay to prevent thundering herd problem
-                # where all tasks try to acquire the semaphore at the same time
-                jitter = random.uniform(0.5, 1.5)
-                retry_delay = 2.0 * jitter
-
-                logger.debug(f"Scheduling retry for paused task: audit_id={audit_id} after {retry_delay:.2f} seconds")
-                time.sleep(retry_delay)
-
-                logger.debug(f"Attempting to retry paused task: audit_id={audit_id}")
-
-                # Check if the task is still in the queue
-                task_exists = False
-                for task in self.queue:
-                    if task['audit_id'] == audit_id:
-                        task_exists = True
-                        break
-
-                if not task_exists:
-                    logger.debug(f"Task no longer exists in queue, cancelling retry: audit_id={audit_id}")
-                    return
-
-                # Try to acquire semaphore with a timeout
-                try:
-                    # Try to acquire with a short timeout
-                    acquired = self.process_semaphore.acquire(blocking=True, timeout=1.0)
-                    if acquired:
-                        logger.debug(f"Acquired process semaphore for paused task: audit_id={audit_id}")
-
-                        # Update task status to Running
-                        self._update_status(audit_id, "Running", "Resuming execution...")
-
-                        # Execute the task
-                        self._execute_task(audit_id, cmd_args, metadata, semaphore=self.process_semaphore)
-                    else:
-                        # Still no semaphore available, schedule another retry with exponential backoff
-                        logger.debug(f"Still no semaphore available for task: audit_id={audit_id}")
-
-                        # Update status to ensure user knows task is still paused
-                        self._update_status(audit_id, "Paused", f"Still waiting for available process slot (retry {metadata.get('retry_count', 1)})")
-
-                        # Increment retry count in metadata
-                        if metadata is None:
-                            metadata = {}
-                        retry_count = metadata.get('retry_count', 0) + 1
-                        metadata['retry_count'] = retry_count
-
-                        # Calculate backoff delay (capped at 30 seconds)
-                        max_delay = min(30.0, 2.0 * (1.5 ** min(retry_count, 10)))
-                        backoff_delay = random.uniform(2.0, max_delay)
-
-                        logger.debug(f"Scheduling retry {retry_count} with backoff delay of {backoff_delay:.2f}s for audit_id={audit_id}")
-
-                        # Use a timer to retry after a delay with exponential backoff
-                        timer = threading.Timer(backoff_delay, lambda audit_id=audit_id, cmd_args=cmd_args, metadata=metadata: self._retry_paused_task(audit_id, cmd_args, metadata))
-                        timer.daemon = True
-                        timer.start()
-                except Exception as e:
-                    logger.error(f"Error acquiring semaphore in retry: {str(e)}")
-                    logger.error(traceback.format_exc())
-
-                    # Schedule another retry
-                    timer = threading.Timer(5.0, lambda audit_id=audit_id, cmd_args=cmd_args, metadata=metadata: self._retry_paused_task(audit_id, cmd_args, metadata))
-                    timer.daemon = True
-                    timer.start()
-            except Exception as e:
-                logger.error(f"Error in retry task thread: {str(e)}")
-                logger.error(traceback.format_exc())
-
-                # Try to update status to reflect the error
-                try:
-                    self._update_status(
-                        audit_id, 
-                        "Error", 
-                        f"Error retrying paused task: {str(e)}"
-                    )
-                except Exception as status_error:
-                    logger.error(f"Error updating status: {str(status_error)}")
-
-        # Start a thread to retry the task after a delay
-        retry_thread = threading.Thread(target=retry_task)
-        retry_thread.daemon = True
-        retry_thread.start()
-
-    def unpause_task(self, audit_id):
-        """Unpause a specific task and submit it to the thread pool
+    def pause_task(self, audit_id):
+        """Pause a task
 
         Args:
             audit_id (str): The unique identifier for the audit task
 
         Returns:
-            bool: True if the task was unpaused successfully, False otherwise
+            bool: True if the task was paused successfully, False otherwise
         """
-        for task in self.queue:
-            if task['audit_id'] == audit_id and task.get('paused', False):
-                task['paused'] = False
-                # Update task status to Queued before submitting to thread pool
-                self._update_status(audit_id, "Queued", "Task unpaused, waiting for available thread...")
-                self._submit_to_thread_pool(task)
-                logger.info(f"Unpaused task: audit_id={audit_id}")
-                return True
+        try:
+            # Find the task in the list
+            for task in self.task_list:
+                if task['audit_id'] == audit_id:
+                    # Mark the task as paused
+                    task['paused'] = True
+                    
+                    # Update task status
+                    self._update_status(audit_id, "Paused", "Task paused by user")
+                    logger.info(f"Paused task: audit_id={audit_id}")
+                    return True
+            
+            logger.warning(f"Task not found for pausing: audit_id={audit_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error pausing task: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
-        logger.warning(f"Task not found or already unpaused: audit_id={audit_id}")
-        return False
+    def resume_task(self, audit_id):
+        """Resume a paused task
 
-    def get_paused_tasks(self):
-        """Get a list of all paused tasks in the queue
+        Args:
+            audit_id (str): The unique identifier for the audit task
 
         Returns:
-            list: A list of paused task dictionaries
+            bool: True if the task was resumed successfully, False otherwise
         """
-        return [task for task in self.queue if task.get('paused', False)]
+        try:
+            # Find the task in the list
+            for task in self.task_list:
+                if task['audit_id'] == audit_id and task.get('paused', False):
+                    # Mark the task as not paused
+                    task['paused'] = False
+                    
+                    # Update task status
+                    self._update_status(audit_id, "Queued", "Task resumed, waiting for worker thread...")
+                    
+                    # Add the task to the queue for processing
+                    self.task_queue.put(task)
+                    
+                    logger.info(f"Resumed task: audit_id={audit_id}")
+                    return True
+            
+            logger.warning(f"Task not found for resuming: audit_id={audit_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error resuming task: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
-    def unpause_all_tasks(self):
-        """Unpause all paused tasks and submit them to the thread pool
+    def cancel_task(self, audit_id):
+        """Cancel a task
+
+        Args:
+            audit_id (str): The unique identifier for the audit task
 
         Returns:
-            int: The number of tasks that were unpaused
+            bool: True if the task was cancelled successfully, False otherwise
         """
-        unpaused_count = 0
-        for task in self.queue:
-            if task.get('paused', False):
-                task['paused'] = False
-                # Update task status to Queued before submitting to thread pool
-                audit_id = task['audit_id']
-                self._update_status(audit_id, "Queued", "Task unpaused, waiting for available thread...")
-                self._submit_to_thread_pool(task)
-                unpaused_count += 1
+        try:
+            # Find the task in the list
+            for i, task in enumerate(self.task_list):
+                if task['audit_id'] == audit_id:
+                    # Remove the task from the list
+                    self.task_list.pop(i)
+                    
+                    # Update task status
+                    self._update_status(audit_id, "Cancelled", "Task cancelled by user")
+                    logger.info(f"Cancelled task: audit_id={audit_id}")
+                    return True
+            
+            logger.warning(f"Task not found for cancelling: audit_id={audit_id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error cancelling task: {str(e)}")
+            logger.error(traceback.format_exc())
+            return False
 
-        logger.info(f"Unpaused {unpaused_count} tasks")
-        return unpaused_count
+    def get_task_status(self, audit_id):
+        """Get the status of a task
+
+        Args:
+            audit_id (str): The unique identifier for the audit task
+
+        Returns:
+            dict: The task status, or None if the task is not found
+        """
+        try:
+            # Find the task in the list
+            for task in self.task_list:
+                if task['audit_id'] == audit_id:
+                    return task.get('status', 'Unknown')
+            
+            logger.warning(f"Task not found for status check: audit_id={audit_id}")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting task status: {str(e)}")
+            logger.error(traceback.format_exc())
+            return None
+
+    def get_all_tasks(self):
+        """Get all tasks
+
+        Returns:
+            list: A list of all tasks
+        """
+        return self.task_list
 
     def stop_processing(self):
-        """Stop processing tasks and shut down the thread pool"""
-        logger.info("Shutting down thread pool")
-
-        # Cancel any pending futures
-        for audit_id, future in self.futures.items():
-            if not future.done():
-                future.cancel()
-                logger.info(f"Cancelled pending task: audit_id={audit_id}")
-
-        # Shutdown the executor (but allow running tasks to complete)
-        self.executor.shutdown(wait=False)
-
+        """Stop processing tasks from the queue"""
+        logger.info("Stopping task processing...")
+        
+        # Set running flag to False to stop worker threads
+        self.running = False
+        
+        # Wait for all worker threads to finish
+        for thread in self.workers:
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+                
         # Clear the queue
-        self.queue.clear()
-        self.futures.clear()
+        while not self.task_queue.empty():
+            try:
+                self.task_queue.get_nowait()
+                self.task_queue.task_done()
+            except Empty:
+                break
+                
+        # Clear the task list
+        self.task_list.clear()
+        
+        logger.info("Task processing stopped")
 
-        logger.info("Stopped task processing")
-
-    def _execute_task(self, audit_id, cmd_args, metadata=None, semaphore=None):
+    def _execute_task(self, audit_id, cmd_args, metadata=None):
         """Execute a task
 
         Args:
@@ -447,7 +374,6 @@ class TaskQueue:
                 - audit_name (str, optional): The audit name
                 - spg_number (str, optional): The SPG number
                 - spg_name (str, optional): The SPG name
-            semaphore (threading.Semaphore, optional): The semaphore to release when the task completes
         """
         metadata = metadata or {}
         audit_name = metadata.get('audit_name')
@@ -524,144 +450,93 @@ class TaskQueue:
                     )
 
                     try:
-                        # Use subprocess.Popen for non-blocking execution
+                        # Use subprocess.Popen for execution
                         logger.debug(f"Starting subprocess for audit_id={audit_id} with working directory set to output directory: {self.output_dir}")
 
-                        # Create the process with a timeout
+                        # Create the process
+                        process = subprocess.Popen(
+                            php_args,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            cwd=self.output_dir,  # Set working directory to output directory
+                            bufsize=1  # Line buffered
+                        )
+                        logger.debug(f"Subprocess started for audit_id={audit_id}, pid={process.pid}")
+
+                        # Wait for the process to complete and capture output
                         try:
-                            process = subprocess.Popen(
-                                php_args,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                cwd=self.output_dir,  # Set working directory to output directory
-                                bufsize=1  # Line buffered
-                            )
-                            logger.debug(f"Subprocess started for audit_id={audit_id}, pid={process.pid}")
-                        except Exception as proc_error:
-                            # Handle error starting the process
-                            error_msg = f"Error starting subprocess: {str(proc_error)}"
-                            logger.error(f"Exception starting subprocess: {error_msg}")
-                            logger.error(traceback.format_exc())
+                            # Use communicate with a timeout to prevent hanging
+                            stdout, stderr = process.communicate(timeout=3600)  # 1 hour timeout
 
-                            # Update task status
-                            self._update_status(
-                                audit_id, 
-                                "Failed", 
-                                error_msg,
-                                log_file=log_file_path,
-                                err_file=err_file_path
-                            )
+                            # Get return code
+                            return_code = process.returncode
+                            logger.debug(f"Process completed for audit_id={audit_id}, return_code={return_code}")
 
-                            # Release the semaphore if provided
-                            if semaphore:
-                                logger.debug(f"Releasing process semaphore for audit_id={audit_id} due to process start error")
-                                semaphore.release()
+                            # Write output to log files
+                            stdout_length = len(stdout)
+                            stderr_length = len(stderr)
+                            logger.debug(f"Command output: stdout={stdout_length} chars, stderr={stderr_length} chars")
 
-                            return
-
-                        # Create a monitoring function to handle process completion
-                        def monitor_process():
                             try:
-                                logger.debug(f"Monitoring process for audit_id={audit_id}, pid={process.pid}")
-
-                                # Wait for process to complete and capture output with a timeout
-                                try:
-                                    # Use communicate with a timeout to prevent hanging
-                                    stdout, stderr = process.communicate(timeout=3600)  # 1 hour timeout
-
-                                    # Get return code
-                                    return_code = process.returncode
-                                    logger.debug(f"Process completed for audit_id={audit_id}, return_code={return_code}")
-
-                                    # Write output to log files
-                                    stdout_length = len(stdout)
-                                    stderr_length = len(stderr)
-                                    logger.debug(f"Command output: stdout={stdout_length} chars, stderr={stderr_length} chars")
-
-                                    try:
-                                        # Write to log files
-                                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                                            log_file.write(stdout)
-                                        with open(err_file_path, 'a', encoding='utf-8') as err_file:
-                                            err_file.write(stderr)
-                                    except Exception as e:
-                                        logger.error(f"Error writing to log files: {str(e)}")
-
-                                    # Process the results
-                                    if return_code == 0:
-                                        # Update with success message
-                                        self._update_status(
-                                            audit_id, 
-                                            "Completed", 
-                                            f"Command executed successfully. Output written to {os.path.basename(log_file_path)}",
-                                            full_output=stdout,
-                                            log_file=log_file_path,
-                                            err_file=err_file_path
-                                        )
-                                    else:
-                                        # Handle error
-                                        error_msg = f"Error executing PHP command (return code {return_code}). Check error log for details."
-                                        logger.error(f"Error in execute_task: {error_msg}")
-                                        self._update_status(
-                                            audit_id, 
-                                            "Failed", 
-                                            error_msg,
-                                            full_output=stdout,
-                                            log_file=log_file_path,
-                                            err_file=err_file_path
-                                        )
-                                except subprocess.TimeoutExpired:
-                                    # Handle timeout
-                                    logger.error(f"Process timed out after 1 hour for audit_id={audit_id}")
-
-                                    # Try to terminate the process
-                                    try:
-                                        process.terminate()
-                                        process.wait(timeout=10)  # Wait up to 10 seconds for termination
-                                    except Exception as term_error:
-                                        logger.error(f"Error terminating process: {str(term_error)}")
-                                        try:
-                                            # Force kill if termination fails
-                                            process.kill()
-                                        except Exception as kill_error:
-                                            logger.error(f"Error killing process: {str(kill_error)}")
-
-                                    # Update status
-                                    self._update_status(
-                                        audit_id, 
-                                        "Failed", 
-                                        "Process timed out after 1 hour",
-                                        log_file=log_file_path,
-                                        err_file=err_file_path
-                                    )
+                                # Write to log files
+                                with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                                    log_file.write(stdout)
+                                with open(err_file_path, 'a', encoding='utf-8') as err_file:
+                                    err_file.write(stderr)
                             except Exception as e:
-                                logger.error(f"Error monitoring process: {str(e)}")
-                                logger.error(traceback.format_exc())
+                                logger.error(f"Error writing to log files: {str(e)}")
+
+                            # Process the results
+                            if return_code == 0:
+                                # Update with success message
                                 self._update_status(
                                     audit_id, 
-                                    "Failed", 
-                                    f"Error monitoring process: {str(e)}",
+                                    "Completed", 
+                                    f"Command executed successfully. Output written to {os.path.basename(log_file_path)}",
+                                    full_output=stdout,
                                     log_file=log_file_path,
                                     err_file=err_file_path
                                 )
-                            finally:
-                                # Release the semaphore if provided
-                                if semaphore:
-                                    logger.debug(f"Releasing process semaphore for audit_id={audit_id}")
-                                    semaphore.release()
+                            else:
+                                # Handle error
+                                error_msg = f"Error executing PHP command (return code {return_code}). Check error log for details."
+                                logger.error(f"Error in execute_task: {error_msg}")
+                                self._update_status(
+                                    audit_id, 
+                                    "Failed", 
+                                    error_msg,
+                                    full_output=stdout,
+                                    log_file=log_file_path,
+                                    err_file=err_file_path
+                                )
+                        except subprocess.TimeoutExpired:
+                            # Handle timeout
+                            logger.error(f"Process timed out after 1 hour for audit_id={audit_id}")
 
-                        # Start a separate thread to monitor the process
-                        monitor_thread = threading.Thread(target=monitor_process, name=f"Monitor-{audit_id}")
-                        monitor_thread.daemon = True
-                        monitor_thread.start()
-                        logger.debug(f"Started monitor thread for audit_id={audit_id}")
+                            # Try to terminate the process
+                            try:
+                                process.terminate()
+                                process.wait(timeout=10)  # Wait up to 10 seconds for termination
+                            except Exception as term_error:
+                                logger.error(f"Error terminating process: {str(term_error)}")
+                                try:
+                                    # Force kill if termination fails
+                                    process.kill()
+                                except Exception as kill_error:
+                                    logger.error(f"Error killing process: {str(kill_error)}")
 
-                        # Return immediately, allowing the worker thread to process other tasks
-                        return
+                            # Update status
+                            self._update_status(
+                                audit_id, 
+                                "Failed", 
+                                "Process timed out after 1 hour",
+                                log_file=log_file_path,
+                                err_file=err_file_path
+                            )
                     except Exception as e:
                         # Handle error starting the subprocess
-                        error_msg = f"Error starting subprocess: {str(e)}"
+                        error_msg = f"Error executing subprocess: {str(e)}"
                         logger.error(f"Exception in execute_task: {error_msg}")
                         logger.error(traceback.format_exc())
 
@@ -673,12 +548,6 @@ class TaskQueue:
                             log_file=log_file_path,
                             err_file=err_file_path
                         )
-
-                        # Release the semaphore if provided
-                        if semaphore:
-                            logger.debug(f"Releasing process semaphore for audit_id={audit_id} due to subprocess start exception")
-                            semaphore.release()
-
                         return
             except Exception as e:
                 # Handle error opening log files
@@ -704,12 +573,6 @@ class TaskQueue:
                     log_file=log_file_path,
                     err_file=err_file_path
                 )
-
-                # Release the semaphore if provided
-                if semaphore:
-                    logger.debug(f"Releasing process semaphore for audit_id={audit_id} due to exception")
-                    semaphore.release()
-
                 return
 
             # Update task status to Processing
@@ -747,194 +610,98 @@ class TaskQueue:
                     # No file to process, so return
                     return
 
-                # File exists, proceed with processing
-                if os.path.exists(file_path):
-                    logger.debug(f"Processing output file: {file_path}")
-                    # Modify the file to replace "#br {" with "br {" between <style> and </style> tags
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as file:
-                            content = file.read()
-                        logger.debug(f"Read {len(content)} bytes from file: {file_path}")
-
-                        # Find the style section
-                        style_start = content.find("<style>")
-                        style_end = content.find("</style>", style_start)
-                        logger.debug(f"Style section found: start={style_start}, end={style_end}")
-
-                        if style_start != -1 and style_end != -1:
-                            # Extract the style section
-                            style_section = content[style_start:style_end]
-                            logger.debug(f"Extracted style section of length {len(style_section)}")
-
-                            # Replace "#br {" with "br {" in the style section
-                            modified_style = style_section.replace("#br {", "br {")
-                            logger.debug("Replaced '#br {' with 'br {' in style section")
-
-                            # Replace the original style section with the modified one
-                            modified_content = content[:style_start] + modified_style + content[style_end:]
-                            logger.debug(f"Created modified content of length {len(modified_content)}")
-
-                            # Write the modified content back to the file
-                            with open(file_path, 'w', encoding='utf-8') as file:
-                                file.write(modified_content)
-                            logger.debug(f"Wrote modified content back to file: {file_path}")
-
-                            # Move the file to the output directory
-                            destination_path = os.path.join(self.output_dir, workbookName)
-                            logger.debug(f"Destination path for file: {destination_path}")
-
-                            # Only move if source and destination are different paths
-                            if file_path != destination_path:
-                                try:
-                                    logger.debug(f"Moving file from {file_path} to {destination_path}")
-                                    # Copy the file to the destination
-                                    shutil.copy2(file_path, destination_path)
-
-                                    # Verify the copy was successful
-                                    if os.path.exists(destination_path):
-                                        # Delete the original file
-                                        os.unlink(file_path)
-                                        logger.info(f"Moved file to output directory and deleted original: {destination_path}")
-                                    else:
-                                        logger.error(f"Failed to copy file to output directory: {destination_path}")
-                                except Exception as e:
-                                    logger.error(f"Error moving file: {str(e)}")
-                                    logger.error(traceback.format_exc())
-                            else:
-                                logger.debug(f"File already in output directory, no need to move: {file_path}")
-
-                            # Update the task status with appropriate message
-                            if file_path != destination_path:
-                                self._update_status(
-                                    audit_id, 
-                                    "Completed", 
-                                    f"File created, modified, and moved to output directory: {workbookName}"
-                                )
-                                logger.info(f"Task {audit_id} completed: file moved to output directory")
-                            else:
-                                self._update_status(
-                                    audit_id, 
-                                    "Completed", 
-                                    f"File created and modified in place: {workbookName}"
-                                )
-                                logger.info(f"Task {audit_id} completed: file modified in place")
-                        else:
-                            # Style tags not found, update the task status
-                            logger.warning(f"Style tags not found in file: {file_path}")
-                            self._update_status(
-                                audit_id, 
-                                "Warning", 
-                                f"File created but style tags not found for modification: {workbookName}"
-                            )
-                    except Exception as e:
-                        # Update the task status if file modification fails
-                        error_msg = f"File created but modification failed: {str(e)}"
-                        logger.error(f"Exception in execute_task file modification: {error_msg}")
-                        logger.error(traceback.format_exc())
-                        logger.debug(f"Exception details for file {file_path}: {type(e).__name__}: {str(e)}")
-                        self._update_status(
-                            audit_id, 
-                            "Warning", 
-                            error_msg
-                        )
-                else:
-                    # Update the task status if file was not created
-                    logger.error(f"File exists check failed for {file_path}")
-                    self._update_status(
-                        audit_id, 
-                        "Error", 
-                        f"File was not created: {workbookName}"
-                    )
-            else:
-                # No workbook name, just update the status
-                logger.info(f"No workbook name provided for audit_id={audit_id}, marking as completed")
+                # Update task status to Completed
                 self._update_status(
                     audit_id, 
                     "Completed", 
-                    "Command executed successfully"
+                    f"Task completed successfully. Output file: {os.path.basename(file_path)}",
+                    output_file=file_path
                 )
-                logger.debug(f"Task {audit_id} completed without workbook name")
-
+            else:
+                # No workbookName, so just mark as completed
+                self._update_status(
+                    audit_id, 
+                    "Completed", 
+                    "Task completed successfully."
+                )
         except Exception as e:
-            # Update the task status if an error occurs
-            error_msg = f"Failed to execute command: {str(e)}"
-            logger.error(f"Exception in execute_task: {error_msg}")
+            logger.error(f"Error executing task: {str(e)}")
             logger.error(traceback.format_exc())
             self._update_status(
                 audit_id, 
                 "Error", 
-                error_msg
+                f"Error executing task: {str(e)}"
             )
 
-    def _update_status(self, audit_id, status, result, full_output=None, log_file=None, err_file=None):
-        """Update the status of a task and call the result callback
+    def _update_status(self, audit_id, status, message, full_output=None, log_file=None, err_file=None, output_file=None):
+        """Update the status of a task and call the result callback if provided
 
         Args:
             audit_id (str): The unique identifier for the audit task
             status (str): The status of the task
-            result (str): The result message
+            message (str): The status message
             full_output (str, optional): The full output of the command
             log_file (str, optional): Path to the log file
             err_file (str, optional): Path to the error file
+            output_file (str, optional): Path to the output file
         """
-        # Log with a more readable format
-        if status in ["Completed", "Failed", "Error", "Warning", "Paused"]:
-            logger.info(f"Task {audit_id} {status.lower()} with result: {result}")
-        else:
-            logger.info(f"Task {audit_id} status updated to {status}: {result}")
-
-        # Update the task status in the queue
-        for task in self.queue:
-            if task['audit_id'] == audit_id:
-                task['status'] = status
-                task['result'] = result
-                break
-
-        # If a task has completed or failed, check if we can unpause a paused task
-        if status in ["Completed", "Failed", "Error"]:
-            # Count active tasks (those that are not paused and not completed)
-            active_tasks = 0
-            for task in self.queue:
-                if not task.get('paused', False) and task.get('status', '') not in ['Completed', 'Failed', 'Error']:
-                    active_tasks += 1
-
-            logger.debug(f"Task {audit_id} {status.lower()}, active tasks: {active_tasks}/{self.executor._max_workers}")
-
-            # If we have fewer active tasks than max_workers, try to unpause a task
-            if active_tasks < self.executor._max_workers:
-                # Find the first paused task
-                for task in self.queue:
-                    if task.get('paused', False):
-                        paused_audit_id = task['audit_id']
-                        logger.info(f"Unpausing task {paused_audit_id} as resources are now available")
-                        # Unpause the task
-                        task['paused'] = False
-                        # Update the task status
-                        self._update_status(paused_audit_id, "Queued", "Task unpaused, resources now available")
-                        # Submit the task to the thread pool
-                        self._submit_to_thread_pool(task)
-                        break
-
-        # Call the result callback if provided
-        if self.result_callback:
-            try:
-                # Use a separate thread for the callback to avoid blocking
-                def call_callback():
-                    try:
-                        # Add a small delay to allow the UI to process other events first
-                        import time
-                        time.sleep(0.01)
-
-                        # Call the callback
-                        self.result_callback(audit_id, status, result, full_output, log_file, err_file)
-                    except Exception as e:
-                        logger.error(f"Error in callback thread: {str(e)}")
-                        logger.error(traceback.format_exc())
-
-                # Start the thread with a lower priority
-                callback_thread = threading.Thread(target=call_callback, daemon=True)
-                callback_thread.name = f"Callback-{audit_id}-{status}"
-                callback_thread.start()
-            except Exception as e:
-                logger.error(f"Error creating callback thread: {str(e)}")
-                logger.error(traceback.format_exc())
+        try:
+            # Find the task in the list
+            task_found = False
+            for task in self.task_list:
+                if task['audit_id'] == audit_id:
+                    # Update the task status
+                    task['status'] = status
+                    task['message'] = message
+                    task['timestamp'] = datetime.now().isoformat()
+                    
+                    # Add additional info if provided
+                    if full_output is not None:
+                        task['full_output'] = full_output
+                    if log_file is not None:
+                        task['log_file'] = log_file
+                    if err_file is not None:
+                        task['err_file'] = err_file
+                    if output_file is not None:
+                        task['output_file'] = output_file
+                        
+                    task_found = True
+                    break
+                    
+            if not task_found:
+                # Task not found in the list, create a new one
+                task = {
+                    'audit_id': audit_id,
+                    'status': status,
+                    'message': message,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Add additional info if provided
+                if full_output is not None:
+                    task['full_output'] = full_output
+                if log_file is not None:
+                    task['log_file'] = log_file
+                if err_file is not None:
+                    task['err_file'] = err_file
+                if output_file is not None:
+                    task['output_file'] = output_file
+                    
+                # Add the task to the list
+                self.task_list.append(task)
+                
+            # Call the result callback if provided
+            if self.result_callback:
+                self.result_callback(
+                    audit_id, 
+                    status, 
+                    message, 
+                    full_output, 
+                    log_file, 
+                    err_file
+                )
+                
+            logger.debug(f"Updated task status: audit_id={audit_id}, status={status}, message={message}")
+        except Exception as e:
+            logger.error(f"Error updating task status: {str(e)}")
+            logger.error(traceback.format_exc())

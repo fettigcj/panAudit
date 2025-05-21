@@ -39,16 +39,16 @@ class PanAuditApplication:
         self.config = config if config is not None else self._load_config()
 
         # Initialize task queue with result callback
-        max_workers = self.config["globalConfig"].get("maxThreads", 5)
-        # Use the same value for max_active_processes as max_workers to ensure consistent behavior
-        max_active_processes = self.config["globalConfig"].get("maxActiveProcesses", max_workers)
+        # Note: maxThreads is kept for backward compatibility but is no longer used
+        # The number of worker threads is now equal to maxActiveProcesses
+        max_active_processes = self.config["globalConfig"].get("maxActiveProcesses", 
+                                                              self.config["globalConfig"].get("maxThreads", 5))
 
         self.task_queue = TaskQueue(
             result_callback=self._handle_task_result,
-            max_workers=max_workers,
             max_active_processes=max_active_processes
         )
-        logger.info(f"Initialized TaskQueue with max_workers={max_workers}, max_active_processes={max_active_processes}")
+        logger.info(f"Initialized TaskQueue with max_active_processes={max_active_processes}")
 
         # Initialize audit manager
         self.audit_manager = AuditManager(self.config, self.task_queue)
@@ -77,8 +77,8 @@ class PanAuditApplication:
             "Panoramas": {},
             "globalConfig": {
                 "currentPanorama": "",
-                "maxThreads": 5,
-                "maxActiveProcesses": 5  # Same as maxThreads for consistent behavior
+                "maxThreads": 5,  # Kept for backward compatibility but no longer used
+                "maxActiveProcesses": 5  # Controls the number of concurrent processes and worker threads
             },
             "extraArguments": {
                 "shadow-ignoreInvalidAddressobjects": "enabled",
