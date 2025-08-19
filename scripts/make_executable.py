@@ -47,6 +47,11 @@ def create_executable():
     try:
         print("Creating executable...")
 
+        # Get absolute paths
+        config_dir = os.path.abspath("config")
+        src_dir = os.path.abspath("src")
+        main_script = os.path.abspath("pan_audit_gui.py")
+
         # Define the PyInstaller command
         pyinstaller_cmd = [
             sys.executable, 
@@ -55,16 +60,20 @@ def create_executable():
             "--name=PanoramaAuditor",
             "--onefile",  # Create a single executable file
             "--windowed",  # Don't show the console window when running the app
-            "--add-data", f"config{os.pathsep}config",  # Include the configuration directory
-            "--add-data", f"src{os.pathsep}src",  # Include the source code directory
+            "--add-data", f"{config_dir}{os.pathsep}config",  # Include the configuration directory
+            "--add-data", f"{src_dir}{os.pathsep}src",  # Include the source code directory
             "--icon=NONE",  # No icon for now, can be customized later
-            "pan_audit_gui.py"  # The main script to package
+            main_script  # The main script to package
         ]
 
         # Convert paths to use backslashes on Windows
         if os.name == 'nt':
-            pyinstaller_cmd[9] = f"config{os.pathsep}config".replace('/', '\\')
-            pyinstaller_cmd[11] = f"src{os.pathsep}src".replace('/', '\\')
+            pyinstaller_cmd[7] = f"{config_dir}{os.pathsep}config".replace('/', '\\')
+            pyinstaller_cmd[9] = f"{src_dir}{os.pathsep}src".replace('/', '\\')
+            pyinstaller_cmd[11] = main_script.replace('/', '\\')
+
+        # Print the command for debugging
+        print(f"Running command: {' '.join(pyinstaller_cmd)}")
 
         # Run PyInstaller
         subprocess.run(pyinstaller_cmd, check=True)
