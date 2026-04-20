@@ -34,7 +34,14 @@ LOGGER = logging.getLogger('PanAuditCLI')
 
 def setup_logging(level: str) -> None:
     lvl = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(level=lvl, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    # Force reconfigure root logger so TaskQueue/application basicConfig doesn't swallow our console output
+    logging.basicConfig(level=lvl, format='%(asctime)s %(levelname)s %(name)s: %(message)s', force=True)
+    # Ensure a console handler is present explicitly
+    ch = logging.StreamHandler()
+    ch.setLevel(lvl)
+    ch.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    root = logging.getLogger()
+    root.handlers = [h for h in root.handlers if not isinstance(h, logging.StreamHandler)] + [ch]
     LOGGER.setLevel(lvl)
 
 
@@ -200,6 +207,10 @@ def run_cmd(args: argparse.Namespace) -> int:
     config_path = os.path.abspath(args.config)
     audits_path = os.path.abspath(args.audits)
 
+    LOGGER.info("PanAudit CLI starting up")
+    LOGGER.info(f"Using config: {config_path}")
+    LOGGER.info(f"Using audits: {audits_path}")
+
     config = load_configs(config_path, audits_path)
 
     # Override output dir if provided
@@ -207,21 +218,22 @@ def run_cmd(args: argparse.Namespace) -> int:
         outdir = os.path.abspath(args.output_dir)
         if not os.path.exists(outdir):
             os.makedirs(outdir, exist_ok=True)
-        # Ensure application uses this
-        # Note: PanAuditApplication uses cwd/output internally; we update cwd by chdir into repo root
-        # so we also modify app directories post-init.
     else:
         outdir = os.path.join(os.getcwd(), 'output')
         os.makedirs(outdir, exist_ok=True)
+    LOGGER.info(f"Output directory: {outdir}")
 
     # Concurrency
     if 'globalConfig' not in config:
         config['globalConfig'] = {}
     config['globalConfig']['maxActiveProcesses'] = max(1, int(args.jobs))
+    LOGGER.info(f"Concurrency (maxActiveProcesses): {config['globalConfig']['maxActiveProcesses']}")
 
     selected = select_panoramas(config, args.panorama)
     if not selected:
+        LOGGER.error("No panoramas selected; exiting with error")
         return 1
+    LOGGER.info(f"Selected panoramas: {', '.join(selected)}")
 
     # Initialize core app with prepared config
     app = PanAuditApplication(config=config)
@@ -237,61 +249,84 @@ def run_cmd(args: argparse.Namespace) -> int:
 
     exit_code = 0
 
-    for pano in selected:
-        LOGGER.info(f"Running audits for Panorama: {pano}")
-        # Switch current panorama in config for this run
-        app.config['globalConfig']['currentPanorama'] = pano
+    try:
+        for pano in selected:
+            LOGGER.info("----------------------------------------------------------------------")
+            LOGGER.info(f"Running audits for Panorama: {pano}")
+            LOGGER.info(f"Dry-run: {args.dry_run} | Timestamped: {args.timestamped} | Delete intermediate: {args.delete_intermediate}")
+            # Switch current panorama in config for this run
+            app.config['globalConfig']['currentPanorama'] = pano
 
-        # Generate tasks
-        tasks = app.audit_manager.generate_audits()
-        if not tasks:
-            LOGGER.warning("No audits generated; skipping")
-            continue
+            # Generate tasks
+            tasks = app.audit_manager.generate_audits()
+            total_tasks = len(tasks) if tasks else 0
+            if not tasks:
+                LOGGER.warning("No audits generated; skipping")
+                continue
 
-        if args.dry_run:
-            LOGGER.info(f"Dry-run: would execute {len(tasks)} audits for {pano}")
-            continue
+            if args.dry_run:
+                LOGGER.info(f"Dry-run: would execute {total_tasks} audits for {pano}")
+                continue
 
-        # Enqueue and execute
-        submitted = app.audit_manager.execute_audits(tasks)
-        LOGGER.info(f"Submitted {submitted} audit tasks for {pano}")
+            # Enqueue and execute
+            submitted = app.audit_manager.execute_audits(tasks)
+            LOGGER.info(f"Submitted {submitted} audit tasks for {pano}")
+            LOGGER.info("Waiting for tasks to complete...")
 
-        # Wait for completion
-        wait_for_tasks(app)
+            # Wait for completion
+            wait_for_tasks(app)
 
-        # Consolidate outputs
-        ok, xlsx = consolidate(app)
-        if not ok:
-            exit_code = 2
-        else:
-            # Optionally rename consolidated to include panorama and timestamped/overwrite policy
-            if args.timestamped:
-                # Already timestamped by analyze_output; optionally prepend panorama
-                try:
-                    if xlsx and pano not in os.path.basename(xlsx):
-                        base = os.path.basename(xlsx)
-                        new_name = f"panAudit_{pano}_{base.split('consolidated_output_')[-1]}"
-                        new_path = os.path.join(os.path.dirname(xlsx), new_name)
-                        os.replace(xlsx, new_path)
-                        xlsx = new_path
-                except Exception as e:
-                    LOGGER.debug(f"Rename skipped: {e}")
+            # Summarize task results
+            tq = app.task_queue
+            task_list = tq.get_all_tasks()
+            status_counts = {"Completed": 0, "Error": 0, "Warning": 0, "Running": 0, "Queued": 0}
+            for t in task_list:
+                st = t.get('status') or 'Unknown'
+                if st in status_counts:
+                    status_counts[st] += 1
+            finished = status_counts["Completed"] + status_counts["Error"] + status_counts["Warning"]
+            LOGGER.info(f"Task summary for {pano}: total={total_tasks}, finished={finished}, completed={status_counts['Completed']}, warnings={status_counts['Warning']}, errors={status_counts['Error']}")
+
+            # Consolidate outputs
+            ok, xlsx = consolidate(app)
+            if not ok:
+                exit_code = 2
             else:
-                # Overwrite stable name per panorama
-                stable = os.path.join(outdir, f"panAudit_{pano}.xlsx")
-                try:
-                    if xlsx:
-                        os.replace(xlsx, stable)
-                        xlsx = stable
-                except Exception as e:
-                    LOGGER.warning(f"Failed to move consolidated to stable name: {e}")
+                # Optionally rename consolidated to include panorama and timestamped/overwrite policy
+                if args.timestamped:
+                    # Already timestamped by analyze_output; optionally prepend panorama
+                    try:
+                        if xlsx and pano not in os.path.basename(xlsx):
+                            base = os.path.basename(xlsx)
+                            new_name = f"panAudit_{pano}_{base.split('consolidated_output_')[-1]}"
+                            new_path = os.path.join(os.path.dirname(xlsx), new_name)
+                            os.replace(xlsx, new_path)
+                            xlsx = new_path
+                    except Exception as e:
+                        LOGGER.debug(f"Rename skipped: {e}")
+                else:
+                    # Overwrite stable name per panorama
+                    stable = os.path.join(outdir, f"panAudit_{pano}.xlsx")
+                    try:
+                        if xlsx:
+                            os.replace(xlsx, stable)
+                            xlsx = stable
+                    except Exception as e:
+                        LOGGER.warning(f"Failed to move consolidated to stable name: {e}")
 
-            LOGGER.info(f"Final report for {pano}: {xlsx}")
+                LOGGER.info(f"Final report for {pano}: {xlsx}")
 
-        # Optionally delete intermediate .xls
-        if args.delete_intermediate:
-            removed = delete_intermediate(outdir)
-            LOGGER.info(f"Deleted {removed} intermediate .xls files for {pano}")
+            # Optionally delete intermediate .xls
+            if args.delete_intermediate:
+                removed = delete_intermediate(outdir)
+                LOGGER.info(f"Deleted {removed} intermediate .xls files for {pano}")
+    finally:
+        # Ensure worker threads are stopped before exiting to avoid background activity
+        try:
+            app.task_queue.stop_processing()
+        except Exception:
+            pass
+        LOGGER.info("PanAudit CLI finished. Exiting.")
 
     return exit_code
 
