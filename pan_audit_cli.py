@@ -320,10 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: List[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    # Default command is run if omitted
-    if args.command is None:
-        args.command = 'run'
+    # Parse known args; if no subcommand provided, reparse with 'run' as default
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    if getattr(args, 'command', None) is None:
+        # Re-parse with 'run' prepended so subparser options (e.g., --log-level) are included
+        args = parser.parse_args(['run', *raw_argv])
 
     # Normalize mutually exclusive flags
     if getattr(args, 'keep_intermediate', False):
