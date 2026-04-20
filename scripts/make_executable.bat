@@ -10,8 +10,14 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+REM Change to the project root directory
+cd ..
+
+REM Display current directory for debugging
+echo Current directory: %CD%
+
 REM Run the Python script to create the executable
-python make_executable.py
+python scripts\make_executable.py
 
 echo.
 if %errorlevel% equ 0 (

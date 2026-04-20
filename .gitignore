@@ -13,3 +13,4 @@ dist/
 # Ignore random crap
 .venv/
 .idea/
+.junie/

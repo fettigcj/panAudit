@@ -79,9 +79,18 @@ class AuditManager:
                 - cmd_string (str): The full command string
         """
         # Create the command arguments dictionary
+        # Resolve panorama address: prefer explicit 'address' field if present; fallback to the key
+        resolved_panorama = panorama
+        try:
+            pano_entry = self.config.get("Panoramas", {}).get(panorama, {})
+            resolved_panorama = pano_entry.get("address", panorama)
+        except Exception:
+            # Be resilient if config shape is unexpected
+            resolved_panorama = panorama
+
         cmd_args = {
             "type": "rule",
-            "in": f"api://{panorama}",
+            "in": f"api://{resolved_panorama}",
             "location": device_group,
             "ruletype": ruletype,
             "actions": f"exporttoexcel:{workbook_name}",
