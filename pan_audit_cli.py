@@ -89,26 +89,61 @@ def load_configs(config_path: str, audits_path: str) -> Dict:
 
 
 def select_panoramas(config: Dict, cli_panoramas: List[str] | None) -> List[str]:
-    """Return list of panorama keys to run. If none provided, use currentPanorama if set, else all."""
+    """Return list of panorama keys to run.
+    Rules:
+    - If --panorama provided, each token may be a name or a 1-based index. Tokens can be comma- or space-separated.
+    - If not provided, use globalConfig.currentPanorama if valid; otherwise default to index 1 (first defined Panorama).
+    """
+    # Preserve JSON order by using dict keys order (Python 3.7+ preserves insertion order)
     available = list(config.get('Panoramas', {}).keys())
     if not available:
         LOGGER.error("No Panoramas configured in panAudit.json")
         return []
 
+    def resolve_token(tok: str) -> str | None:
+        t = tok.strip()
+        if not t:
+            return None
+        if t.isdigit():
+            idx = int(t)
+            if 1 <= idx <= len(available):
+                name = available[idx - 1]
+                LOGGER.debug(f"--panorama index {idx} -> '{name}'")
+                return name
+            else:
+                LOGGER.error(f"Panorama index out of range: {idx}. Valid range is 1..{len(available)}")
+                return None
+        # name path
+        if t in available:
+            return t
+        LOGGER.error(f"Unknown Panorama: '{t}'. Available: {', '.join(available)}")
+        return None
+
     if cli_panoramas:
-        # Validate provided
-        bad = [p for p in cli_panoramas if p not in available]
-        if bad:
-            LOGGER.error(f"Unknown Panorama(s): {', '.join(bad)}. Available: {', '.join(available)}")
-            return []
-        return cli_panoramas
+        # Flatten comma-separated values inside tokens
+        flat_tokens: List[str] = []
+        for token in cli_panoramas:
+            if token is None:
+                continue
+            parts = [p for p in (token.split(',') if ',' in token else [token])]
+            flat_tokens.extend(parts)
+        resolved: List[str] = []
+        seen = set()
+        for tok in flat_tokens:
+            name = resolve_token(tok)
+            if name is None:
+                return []  # abort on any bad token
+            if name not in seen:
+                seen.add(name)
+                resolved.append(name)
+        return resolved
 
     current = config.get('globalConfig', {}).get('currentPanorama')
     if current and current in available:
         return [current]
 
-    # default to all
-    return available
+    # Default to first panorama (index 1) when not specified and no valid currentPanorama
+    return [available[0]]
 
 
 def wait_for_tasks(app: PanAuditApplication, poll_interval: float = 0.5) -> None:
@@ -271,7 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     for rp in (runp,):
         rp.add_argument('--config', default=os.path.join('config', 'panAudit.json'), help='Path to panAudit.json')
         rp.add_argument('--audits', default=os.path.join('config', 'audits.json'), help='Path to audits.json')
-        rp.add_argument('--panorama', nargs='*', help='One or more Panorama keys as defined in panAudit.json')
+        rp.add_argument('--panorama', nargs='*', help='Panorama selector(s): name(s) or 1-based index(es). Comma or space separated. If omitted, uses currentPanorama; else defaults to index 1.')
         rp.add_argument('--output-dir', default=os.path.join('output'), help='Directory for outputs and final report')
         rp.add_argument('--jobs', type=int, default=2, help='Max concurrent pan-os-php processes')
         rp.add_argument('--delete-intermediate', action='store_true', help='Delete per-audit .xls files after consolidation')
