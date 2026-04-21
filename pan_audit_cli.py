@@ -346,7 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
         rp.add_argument('--jobs', type=int, default=2, help='Max concurrent pan-os-php processes')
         rp.add_argument('--delete-intermediate', action='store_true', help='Delete per-audit .xls files after consolidation')
         rp.add_argument('--keep-intermediate', action='store_true', help='Keep per-audit .xls files (overrides --delete-intermediate)')
-        rp.add_argument('--timestamped', action='store_true', help='Keep timestamp in consolidated filename (adds panorama prefix)')
+        # Timestamped output is the default; allow opting out with --no-timestamp
+        rp.add_argument('--timestamped', dest='timestamped', action='store_true', default=True,
+                        help='Keep timestamp in consolidated filename (default). Adds panorama prefix')
+        rp.add_argument('--no-timestamp', dest='timestamped', action='store_false',
+                        help='Disable timestamping and overwrite stable panAudit_{panorama}.xlsx')
         rp.add_argument('--log-level', default='info', help='Log level (debug, info, warning, error)')
         rp.add_argument('--dry-run', action='store_true', help='Print what would run without executing audits')
 
