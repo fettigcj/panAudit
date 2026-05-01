@@ -14,3 +14,7 @@ dist/
 .venv/
 .idea/
 .junie/
+# Ignore local config
+config/panAudit.json
+!config/panAudit_Sample.json
+
