@@ -106,3 +106,21 @@ The application allows customization of:
 ## License
 
 This project is open-source, copyleft rights are granted as specified by GPL 3.0
+
+## Configuration
+
+This project uses a sanitized sample configuration so private details aren	 committed to Git.
+
+1. Copy the sample file and remove the _Sample suffix:
+   ``n   cp config/panAudit_Sample.json config/panAudit.json
+   ``n   On Windows PowerShell:
+   ``n   Copy-Item config\\panAudit_Sample.json config\\panAudit.json
+   ``n2. Open config/panAudit.json and edit it to reflect your environment:
+   - Set each Panorama ddress (e.g., panorama01.example.com).
+   - Adjust uditTarget, uditSPGs (e.g., spg01..spg05), and other fields as needed.
+   - Update globalConfig.currentPanorama to the Panorama you want to target by default.
+
+Notes:
+- The real config/panAudit.json is ignored by Git (.gitignore) to protect confidential data.
+- The sample file (config/panAudit_Sample.json) remains in the repository as a template.
+
