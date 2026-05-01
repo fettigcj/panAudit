@@ -1,6 +1,6 @@
 ﻿{
     "Panoramas":  {
-                      "zappana0001":  {
+                      "panorama01":  {
                                           "address":  "panorama01.example.com",
                                           "auditTarget":  "any",
                                           "auditSPGs":  [
@@ -12,8 +12,8 @@
                                                         ],
                                           "includeDisabledRules":  false
                                       },
-                      "zappala0001":  {
-                                          "address":  "panorama01.example.com",
+                      "panorama02":  {
+                                          "address":  "panorama02.example.com",
                                           "auditTarget":  "any",
                                           "auditSPGs":  [
                                                             "spg01",
@@ -26,7 +26,7 @@
                                       }
                   },
     "globalConfig":  {
-                         "currentPanorama":  "panorama.example.com",
+                         "currentPanorama":  "panorama01.example.com",
                          "maxThreads":  15,
                          "panOsPhpRepoUrl":  "https://github.com/swaschkut/pan-os-php"
                      }
