@@ -18,3 +18,5 @@ dist/
 config/panAudit.json
 !config/panAudit_Sample.json
 
+__pycache__/
+*.pyc
