@@ -1,0 +1,8 @@
+# Runtime dependencies (tkinter ships with Python; PHP and git must be installed separately)
+requests
+pandas
+xlsxwriter
+beautifulsoup4
+
+# Only needed to build the standalone executable (scripts/make_executable.py)
+# pyinstaller
